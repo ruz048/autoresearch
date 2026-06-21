@@ -331,10 +331,13 @@ def setup_logging(log_path: Path):
 
 
 def main():
-    default_tag = datetime.datetime.now().strftime("%b%d").lower()  # e.g. 'jun21'
+    # Timestamp down to the second so multiple runs on the same day never collide
+    # on the same branch (e.g. 'jun21-143022').
+    default_tag = datetime.datetime.now().strftime("%b%d-%H%M%S").lower()
     p = argparse.ArgumentParser(description="Autonomous autoresearch loop via Claude Agent SDK")
     p.add_argument("--experiments", type=int, default=100, help="number of experiments to run")
-    p.add_argument("--tag", default=default_tag, help="run tag -> branch autoresearch/<tag>")
+    p.add_argument("--tag", default=default_tag,
+                   help="run tag -> branch autoresearch/<tag> (default: timestamp, e.g. jun21-143022)")
     p.add_argument("--model", default="claude-opus-4-8", help="model id for the agent")
     p.add_argument("--max-turns", type=int, default=80, help="max agent turns per experiment")
     p.add_argument("--no-setup", action="store_true", help="skip setup; continue current branch")
