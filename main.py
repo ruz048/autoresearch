@@ -166,11 +166,12 @@ def parse_metrics(log_path: Path):
     return float(bpb.group(1)), (float(vram.group(1)) if vram else 0.0)
 
 
-async def run_training(gpu, run_timeout):
+async def run_training(gpu, run_timeout, time_budget):
     """Run `python train.py` as a subprocess. Returns (val_bpb, peak_vram_mb, ok)."""
     env = os.environ.copy()
     if gpu is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env["AUTORESEARCH_TIME_BUDGET"] = str(time_budget)  # read by prepare.py
     print(f"   ▶ training… (logging to {RUN_LOG.name}, gpu={gpu if gpu is not None else 'default'})")
     with open(RUN_LOG, "wb") as f:
         proc = await asyncio.create_subprocess_exec(
@@ -275,7 +276,8 @@ async def run(args):
     print(f"Repo:        {REPO}")
     print(f"Model:       {args.model}")
     print(f"Branch tag:  autoresearch/{args.tag}")
-    print(f"Experiments: {args.experiments}   GPU: {args.gpu}   run-timeout: {args.run_timeout}s")
+    print(f"Experiments: {args.experiments}   GPU: {args.gpu}   "
+          f"time-budget: {args.time_budget}s   run-timeout: {args.run_timeout}s")
     print("=" * 70)
 
     if not args.no_setup:
@@ -302,7 +304,7 @@ async def run(args):
                 commit = head_short()
                 print(f"   committed {commit}: {desc}")
 
-            bpb, vram, ok = await run_training(args.gpu, args.run_timeout)
+            bpb, vram, ok = await run_training(args.gpu, args.run_timeout, args.time_budget)
 
             if not ok:
                 status = "crash"
@@ -332,6 +334,8 @@ def main():
                    help="run tag -> branch autoresearch/<tag> (default: timestamp, e.g. jun21-143022)")
     p.add_argument("--model", default="claude-opus-4-8", help="model id for the agent")
     p.add_argument("--gpu", default=None, help="CUDA_VISIBLE_DEVICES for training (e.g. 1)")
+    p.add_argument("--time-budget", type=int, default=300,
+                   help="training time budget in seconds per run (default 300; e.g. 1000)")
     p.add_argument("--run-timeout", type=int, default=2400,
                    help="kill a single training run after this many seconds (hang guard)")
     p.add_argument("--max-turns", type=int, default=12, help="max agent turns per edit proposal")
