@@ -1,29 +1,32 @@
 """
 main.py — Autonomous LLM-pretraining research loop driven by the Claude Agent SDK.
 
-This replaces the "spin up Claude Code interactively and prompt it" workflow from
-the README with a single self-contained Python orchestrator. It drives the exact
-experiment loop defined in program.md:
+Replaces the "spin up Claude Code interactively" workflow with a single Python
+orchestrator. Clean separation of responsibilities:
 
-    edit train.py -> git commit -> train for 5 min -> read val_bpb ->
-    keep (advance branch) or revert (git reset) -> log to results.tsv -> repeat
+    THE AGENT      only edits train.py (proposes one change per experiment).
+    PYTHON (here)  does everything operational: git commit, run training as a
+                   subprocess (no tool-timeout limit), read val_bpb, decide
+                   keep/revert, and log to results.tsv.
 
-The orchestration lives here in Python; the *reasoning* (what to change, whether a
-result is worth keeping) is done by the agent. A single persistent ClaudeSDKClient
-session is used so the agent remembers what it already tried across experiments.
+Because Python runs the training (not a bounded agent tool call), experiments can
+take arbitrarily long — e.g. with TIME_BUDGET raised to 1000s, a run is ~19 min,
+which would blow past the SDK's 600s Bash-tool cap. Here that limit is irrelevant.
 
 Usage:
-    conda activate autoresearch          # must be the env that has torch etc.
+    conda activate autoresearch
     python main.py                       # ~100 experiments on a fresh branch
-    python main.py --experiments 30
-    python main.py --tag jun21 --model claude-opus-4-6
-    python main.py --no-setup            # skip setup, continue an existing branch
+    python main.py --experiments 20 --gpu 1
+    python main.py --tag myrun --model claude-opus-4-8
+    python main.py --no-setup            # skip setup, continue current branch
 """
 
 import argparse
 import asyncio
 import datetime
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -40,197 +43,217 @@ from claude_agent_sdk import (
 )
 
 REPO = Path(__file__).resolve().parent
+PYTHON = sys.executable  # the env python running this file (used to run train.py)
+RUN_LOG = REPO / "run.log"
+RESULTS_TSV = REPO / "results.tsv"
+EDITABLE = "train.py"  # the ONLY file the agent may touch
 
 # ---------------------------------------------------------------------------
-# Enforcement layer (can_use_tool): the HARD guarantee, not the soft prompt.
-#
-# The SDK calls guard() before every tool use. We deny anything outside the
-# training-code workspace. This is enforcement, independent of what the model
-# "intends" or what the system prompt says.
+# Enforcement: the agent may ONLY edit train.py. It has no Bash at all, so it
+# cannot run training, touch git, or reach the network. Python does all of that.
 # ---------------------------------------------------------------------------
-
-# Files the agent is allowed to create/modify. train.py is the code space;
-# results.tsv is the experiment log. Nothing else may be written.
-WRITABLE_FILES = {"train.py", "results.tsv"}
-
-# Bash commands matching any of these are hard-denied. The first group is the
-# important one: anything that talks to a git remote or GitHub.
-BASH_DENY_PATTERNS = [
-    r"\bgit\s+push\b",
-    r"\bgit\s+remote\b",
-    r"\bgit\s+fetch\b",
-    r"\bgit\s+pull\b",
-    r"\bgit\s+clone\b",
-    r"\bgit\s+(remote\s+)?(set-url|add)\b.*(https?://|git@)",
-    r"\bgh\b",                       # GitHub CLI
-    r"\bsudo\b",
-    r"\brm\s+-rf\s+/(?!home/ruiyi/autoresearch)",  # rm -rf of anything but this repo
-    r":\(\)\s*\{",                   # fork-bomb-ish
-    r"\bcurl\b.*\|\s*(ba)?sh\b",     # curl | sh
-    r"\bwget\b.*\|\s*(ba)?sh\b",
-]
-
-
-def _path_in_repo(file_path: str) -> bool:
-    try:
-        Path(file_path).resolve().relative_to(REPO)
-        return True
-    except (ValueError, RuntimeError):
-        return False
-
 
 async def guard(tool_name, tool_input, context):
-    """Return Allow/Deny for each tool call. Deny = the agent cannot do it."""
-    # 1) File writes: only train.py / results.tsv, only inside the repo.
     if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         fp = tool_input.get("file_path", "")
-        if not _path_in_repo(fp) or Path(fp).name not in WRITABLE_FILES:
+        try:
+            in_repo = Path(fp).resolve().parent == REPO
+        except (ValueError, RuntimeError):
+            in_repo = False
+        if not in_repo or Path(fp).name != EDITABLE:
             return PermissionResultDeny(
-                message=f"Blocked: may only edit {sorted(WRITABLE_FILES)} inside {REPO}. "
-                        f"prepare.py and all other files are read-only.",
+                message=f"Blocked: you may only edit {EDITABLE}. All other files are read-only.",
             )
         return PermissionResultAllow()
-
-    # 2) Bash: hard-deny remote git ops and other dangerous patterns.
-    if tool_name == "Bash":
-        cmd = tool_input.get("command", "")
-        for pat in BASH_DENY_PATTERNS:
-            if re.search(pat, cmd):
-                return PermissionResultDeny(
-                    message=f"Blocked by safety policy (matched /{pat}/). Remote git "
-                            f"operations and out-of-repo destructive commands are not allowed.",
-                )
-        return PermissionResultAllow()
-
-    # 3) Read-only / housekeeping tools (Read, Grep, Glob, TodoWrite): allow.
+    # Read / Grep / Glob are fine; no other tools are granted.
     return PermissionResultAllow()
 
-# ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
 
-# Appended to Claude Code's own system prompt so the agent keeps full tool
-# behavior but learns the rules of THIS run. Two things differ from program.md:
-# we run under conda (so `python`, not `uv run`), and training is launched in the
-# background and polled so it can't hit the Bash tool's wall-clock timeout.
-SYSTEM_APPEND = """
-You are an autonomous ML research agent operating the `autoresearch` repo. Your
-single objective is to minimize val_bpb (validation bits per byte) on the fixed
-5-minute training budget. Follow program.md as the source of truth for the
-workflow, EXCEPT for the two environment overrides below.
+SYSTEM_APPEND = f"""
+You are an autonomous ML research agent. Your ONLY job is to edit {EDITABLE} to
+lower val_bpb (validation bits per byte). A separate Python harness does
+everything else automatically AFTER you edit: it commits, runs the 5-minute-budget
+(or longer) training, reads val_bpb, and keeps or reverts your change.
 
-ENVIRONMENT OVERRIDES (this machine, not the defaults in program.md/README):
-- We run inside a conda env, NOT uv. Whenever program.md says `uv run train.py`
-  or `uv run prepare.py`, run `python train.py` / `python prepare.py` instead.
-- The GPU is an A100 (not H100), so the mfu_percent number in the output is
-  computed against the wrong peak FLOPS — ignore it. val_bpb is still valid and
-  is the only metric that matters.
+YOU DO NOT and CANNOT:
+- run training, run git, run any shell command (you have no Bash tool),
+- edit any file other than {EDITABLE},
+- decide keep/discard — the harness compares val_bpb and decides.
 
-RUNNING A TRAINING EXPERIMENT (run it in the FOREGROUND, one blocking call):
-- This is a SINGLE GPU and you do exactly ONE training run per turn. Run training
-  as ONE foreground Bash command and WAIT for it to finish IN THE SAME TURN.
-- Do NOT use `&` and do NOT use run_in_background. A backgrounded run makes your
-  turn end before training completes, which breaks the whole loop (the orchestrator
-  will think the experiment finished and move on while nothing actually ran).
-- A run takes ~5 min of training + compile/eval overhead (~6-8 min total), so set
-  the Bash tool `timeout` to its maximum (600000 ms) on that one command:
-    python train.py > run.log 2>&1
-- When it returns, read ONLY the metric lines (never echo the whole log):
-    grep "^val_bpb:\\|^peak_vram_mb:" run.log
-- If that grep is empty the run crashed: `tail -n 30 run.log`, then decide to fix
-  (only if it's a trivial bug) or skip it as a crash and revert.
-- If a single run ever exceeds the 600000 ms Bash timeout, treat it as a failure,
-  revert, and move on — do not retry it in the background.
+EACH TURN:
+1. You are told the current best val_bpb and recent experiment history.
+2. Pick ONE concrete, well-motivated change to {EDITABLE} (architecture,
+   optimizer, hyperparameters, batch size, schedule, etc.) you believe lowers
+   val_bpb. Make focused, single-idea changes.
+3. Apply it by editing {EDITABLE}. Do NOT modify prepare.py or the eval.
+4. Reply with EXACTLY ONE final line describing the change, prefixed `CHANGE:`
+   and containing NO commas (it goes into a tab-separated log). Example:
+   CHANGE: raise MATRIX_LR 0.04->0.05 (more aggressive Muon step)
 
-DISCIPLINE:
-- One experiment = one idea. Make a focused change, commit, run, evaluate, decide.
-- Keep (advance the branch) only if val_bpb strictly improved; otherwise
-  `git reset --hard` back to the prior commit. Honor the simplicity criterion.
-- Append every experiment to results.tsv (tab-separated). Do NOT git-commit
-  results.tsv (it stays untracked).
-- Do not modify prepare.py or the evaluate_bpb metric.
+Honor a simplicity criterion: equal-or-better val_bpb with simpler code is a win;
+tiny gains that add ugly complexity are not. Learn from the history — don't repeat
+changes already shown to be worse, and try combining what worked.
 """.strip()
 
-SETUP_PROMPT = """
-Let's set up a new autonomous research run. Do the Setup section of program.md,
-adapted to this environment:
+PROPOSE_PROMPT = """
+Current best val_bpb: {best}
+Recent experiments (most recent last):
+{history}
 
-1. Read README.md, program.md, prepare.py, and train.py for full context.
-2. Create a fresh branch `autoresearch/{tag}` from the current branch
-   (`git checkout -b autoresearch/{tag}`). If it already exists, stop and tell me.
-3. Verify the data + tokenizer cache exists at ~/.cache/autoresearch/ (data
-   shards + tokenizer). If it is missing, STOP and tell me to run
-   `python prepare.py` first — do not try to run it yourself.
-4. Initialize results.tsv with exactly this header row (tab-separated) and
-   nothing else:  commit\tval_bpb\tmemory_gb\tstatus\tdescription
-   Leave results.tsv untracked by git.
-
-Then briefly confirm the setup looks good. Do NOT start training yet.
-""".strip()
-
-# The first real experiment must be the baseline (train.py unchanged).
-FIRST_EXPERIMENT_PROMPT = """
-Run experiment #1: the BASELINE. Do not change train.py at all. Commit the
-current state if needed, run the training experiment (foreground, one blocking
-call, as instructed), read out val_bpb and peak_vram_mb, and record the result in
-results.tsv with status `keep` and description `baseline`. This establishes the
-number every later experiment is compared against. Report the baseline val_bpb.
-""".strip()
-
-NEXT_EXPERIMENT_PROMPT = """
-Run experiment #{n}. Pick ONE concrete, well-motivated change to train.py
-(architecture, optimizer, hyperparameters, batch size, schedule, etc.) that you
-believe will lower val_bpb relative to the best result so far. Briefly state your
-hypothesis, edit train.py, git commit, run the experiment (foreground, one
-blocking call), read val_bpb + peak_vram_mb, and:
-  - if val_bpb strictly improved over the current best: keep it (branch advances),
-    log status `keep`.
-  - otherwise: `git reset --hard` to the prior commit, log status `discard`
-    (or `crash` if it failed), and move on.
-Append the row to results.tsv. Then give me a one-line summary: the change, the
-val_bpb, and the keep/discard decision. Do not stop to ask whether to continue.
+Propose and apply ONE change to train.py now. End with a single `CHANGE:` line.
 """.strip()
 
 
 # ---------------------------------------------------------------------------
-# Pretty-printing of the streamed agent messages
+# Logging (mirror this orchestrator's stdout/stderr to a file)
 # ---------------------------------------------------------------------------
 
-def _short(text, limit=2000):
-    text = text.strip()
-    return text if len(text) <= limit else text[:limit] + " […]"
+class _Tee:
+    def __init__(self, stream, fh):
+        self._stream, self._fh = stream, fh
+
+    def write(self, data):
+        self._stream.write(data)
+        self._fh.write(data)
+        self._fh.flush()
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._fh.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
-async def drive_turn(client: ClaudeSDKClient, prompt: str):
-    """Send one prompt and stream the agent's work until the turn completes."""
+def setup_logging(log_path: Path):
+    fh = open(log_path, "a", buffering=1, encoding="utf-8")
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fh.write(f"\n{'='*70}\n# main.py session started {stamp}\n{'='*70}\n")
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+    return fh
+
+
+# ---------------------------------------------------------------------------
+# Git / training / results helpers (all Python, no agent involvement)
+# ---------------------------------------------------------------------------
+
+def git(*args, check=True):
+    return subprocess.run(["git", *args], cwd=REPO, check=check,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def head_short():
+    return git("rev-parse", "--short", "HEAD")
+
+
+def train_py_changed():
+    # exit code 1 => differences present
+    return subprocess.run(["git", "diff", "--quiet", "--", EDITABLE],
+                          cwd=REPO).returncode != 0
+
+
+def parse_metrics(log_path: Path):
+    """Return (val_bpb, peak_vram_mb) or (None, None) if the run crashed."""
+    if not log_path.exists():
+        return None, None
+    text = log_path.read_text(errors="ignore")
+    bpb = re.search(r"^val_bpb:\s+([\d.]+)", text, re.M)
+    vram = re.search(r"^peak_vram_mb:\s+([\d.]+)", text, re.M)
+    if not bpb:
+        return None, None
+    return float(bpb.group(1)), (float(vram.group(1)) if vram else 0.0)
+
+
+async def run_training(gpu, run_timeout):
+    """Run `python train.py` as a subprocess. Returns (val_bpb, peak_vram_mb, ok)."""
+    env = os.environ.copy()
+    if gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    print(f"   ▶ training… (logging to {RUN_LOG.name}, gpu={gpu if gpu is not None else 'default'})")
+    with open(RUN_LOG, "wb") as f:
+        proc = await asyncio.create_subprocess_exec(
+            PYTHON, "train.py", cwd=str(REPO), env=env,
+            stdout=f, stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=run_timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            print(f"   ✗ run exceeded {run_timeout}s — killed, treating as crash")
+            return None, None, False
+    bpb, vram = parse_metrics(RUN_LOG)
+    if bpb is None:
+        tail = "\n".join(RUN_LOG.read_text(errors="ignore").splitlines()[-15:])
+        print(f"   ✗ crash (no val_bpb). Last lines:\n{tail}")
+        return None, None, False
+    return bpb, vram, True
+
+
+def append_result(commit, bpb, vram, status, desc):
+    if not RESULTS_TSV.exists():
+        RESULTS_TSV.write_text("commit\tval_bpb\tmemory_gb\tstatus\tdescription\n")
+    bpb_s = f"{bpb:.6f}" if bpb is not None else "0.000000"
+    gb_s = f"{vram/1024:.1f}" if vram else "0.0"
+    with RESULTS_TSV.open("a") as f:
+        f.write(f"{commit}\t{bpb_s}\t{gb_s}\t{status}\t{desc}\n")
+
+
+def results_history(n=12):
+    if not RESULTS_TSV.exists():
+        return "(none yet)"
+    rows = RESULTS_TSV.read_text().splitlines()[1:]  # drop header
+    return "\n".join(rows[-n:]) if rows else "(none yet)"
+
+
+def setup_run(tag):
+    """Pure-Python setup: verify cache, create the branch, init results.tsv."""
+    cache = Path.home() / ".cache" / "autoresearch"
+    if not (cache / "tokenizer" / "tokenizer.pkl").exists():
+        print(f"!! data/tokenizer cache missing at {cache} — run `python prepare.py` first.")
+        sys.exit(1)
+
+    branch = f"autoresearch/{tag}"
+    existing = git("branch", "--list", branch)
+    if existing:
+        print(f"!! branch {branch} already exists — pick a different --tag.")
+        sys.exit(1)
+    git("checkout", "-b", branch)
+    # Anchor the exact working state (incl. any prepare.py budget change) as the
+    # baseline commit so `git reset --hard` reverts are always safe.
+    git("add", "-A")
+    if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=REPO).returncode != 0:
+        git("commit", "-m", f"baseline: run config for {branch}")
+    print(f"   branch {branch} @ {head_short()} ready")
+    # results.tsv starts fresh (untracked / gitignored)
+    RESULTS_TSV.write_text("commit\tval_bpb\tmemory_gb\tstatus\tdescription\n")
+
+
+# ---------------------------------------------------------------------------
+# Agent interaction: one turn that edits train.py and returns a description
+# ---------------------------------------------------------------------------
+
+async def propose_edit(client, best, history):
+    prompt = PROPOSE_PROMPT.format(best=(f"{best:.6f}" if best else "n/a"), history=history)
     await client.query(prompt)
+    desc = None
     async for message in client.receive_response():
         if isinstance(message, AssistantMessage):
             for block in message.content:
-                if isinstance(block, TextBlock):
-                    if block.text.strip():
-                        print(f"\n🤖 {_short(block.text)}")
+                if isinstance(block, TextBlock) and block.text.strip():
+                    print(f"   🤖 {block.text.strip()[:600]}")
+                    m = re.search(r"CHANGE:\s*(.+)", block.text)
+                    if m:
+                        desc = m.group(1).strip().replace("\t", " ").replace(",", ";")
                 elif isinstance(block, ThinkingBlock):
-                    # Keep thinking quiet but show it's happening.
-                    print("   …thinking…", flush=True)
-                elif isinstance(block, ToolUseBlock):
-                    arg = ""
-                    if block.name == "Bash":
-                        arg = block.input.get("command", "")
-                    elif block.name in ("Edit", "Write", "Read"):
-                        arg = block.input.get("file_path", "")
-                    print(f"   ⚙️  {block.name}: {_short(str(arg), 200)}")
+                    print("      …thinking…")
+                elif isinstance(block, ToolUseBlock) and block.name in ("Edit", "Write"):
+                    print(f"      ✏️  edit {Path(block.input.get('file_path','')).name}")
         elif isinstance(message, ResultMessage):
-            cost = getattr(message, "total_cost_usd", None)
-            turns = getattr(message, "num_turns", None)
-            extra = []
-            if turns is not None:
-                extra.append(f"{turns} turns")
-            if cost is not None:
-                extra.append(f"${cost:.3f}")
-            print(f"   ── turn complete ({', '.join(extra)}) ──")
-            return message
-    return None
+            break
+    return desc or "edit train.py (no description)"
 
 
 # ---------------------------------------------------------------------------
@@ -241,105 +264,77 @@ async def run(args):
     options = ClaudeAgentOptions(
         cwd=str(REPO),
         model=args.model,
-        system_prompt={
-            "type": "preset",
-            "preset": "claude_code",
-            "append": SYSTEM_APPEND,
-        },
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Grep", "Glob", "TodoWrite"],
-        # Enforcement layer: guard() is consulted before EVERY tool call and is
-        # what actually keeps the agent inside the training-code workspace.
+        system_prompt={"type": "preset", "preset": "claude_code", "append": SYSTEM_APPEND},
+        allowed_tools=["Read", "Edit", "Grep", "Glob"],  # NO Bash, NO Write-elsewhere
         can_use_tool=guard,
         permission_mode="default",
-        # One experiment needs many tool calls (edit, commit, launch, ~10 polls,
-        # grep, log, decide). Give each turn plenty of headroom.
         max_turns=args.max_turns,
-        # Let the SDK load CLAUDE.md / project settings if present.
         setting_sources=["project"],
     )
 
     print(f"Repo:        {REPO}")
     print(f"Model:       {args.model}")
     print(f"Branch tag:  autoresearch/{args.tag}")
-    print(f"Experiments: {args.experiments}")
+    print(f"Experiments: {args.experiments}   GPU: {args.gpu}   run-timeout: {args.run_timeout}s")
     print("=" * 70)
 
-    results_tsv = REPO / "results.tsv"
+    if not args.no_setup:
+        print("\n### SETUP ###")
+        setup_run(args.tag)
 
-    def result_rows():
-        # number of logged experiments (data rows, excluding the header)
-        if not results_tsv.exists():
-            return 0
-        return max(0, sum(1 for _ in results_tsv.open()) - 1)
+    best_bpb = None
+    keep_commit = head_short()
 
     async with ClaudeSDKClient(options=options) as client:
-        if not args.no_setup:
-            print("\n### SETUP ###")
-            await drive_turn(client, SETUP_PROMPT.format(tag=args.tag))
-
         for n in range(1, args.experiments + 1):
             print(f"\n### EXPERIMENT {n}/{args.experiments} ###")
+
             if n == 1 and not args.no_setup:
-                prompt = FIRST_EXPERIMENT_PROMPT
+                # Baseline: run train.py unchanged at the branch baseline commit.
+                desc, commit = "baseline", keep_commit
             else:
-                prompt = NEXT_EXPERIMENT_PROMPT.format(n=n)
-            before = result_rows()
-            try:
-                await drive_turn(client, prompt)
-            except Exception as e:  # keep the loop alive across transient failures
-                print(f"   !! turn error: {e!r} — continuing to next experiment")
-            # A real experiment appends exactly one row to results.tsv. If it
-            # didn't grow, the turn did no real work (e.g. it only polled/waited) —
-            # surface that instead of silently printing the next banner.
-            if result_rows() == before:
-                print(f"   ⚠️  no new results.tsv row after experiment {n} — "
-                      f"the turn logged nothing (no real run completed).")
+                desc = await propose_edit(client, best_bpb, results_history())
+                if not train_py_changed():
+                    print("   ⚠️  agent did not modify train.py — skipping this experiment.")
+                    continue
+                git("add", EDITABLE)
+                git("commit", "-m", f"exp {n}: {desc}")
+                commit = head_short()
+                print(f"   committed {commit}: {desc}")
+
+            bpb, vram, ok = await run_training(args.gpu, args.run_timeout)
+
+            if not ok:
+                status = "crash"
+                if commit != keep_commit:
+                    git("reset", "--hard", keep_commit)
+            elif best_bpb is None or bpb < best_bpb:
+                status, best_bpb, keep_commit = "keep", bpb, commit
+            else:
+                status = "discard"
+                if commit != keep_commit:
+                    git("reset", "--hard", keep_commit)
+
+            append_result(commit, bpb, vram, status, desc)
+            best_s = f"{best_bpb:.6f}" if best_bpb else "n/a"
+            bpb_s = f"{bpb:.6f}" if bpb else "CRASH"
+            print(f"   → {status.upper()}: val_bpb={bpb_s} (best={best_s})")
 
     print("\n" + "=" * 70)
-    print("Done. See results.tsv for the experiment log and `git log` for kept changes.")
-
-
-class _Tee:
-    """Duplicate a text stream to the console AND a log file."""
-
-    def __init__(self, stream, fh):
-        self._stream = stream
-        self._fh = fh
-
-    def write(self, data):
-        self._stream.write(data)
-        self._fh.write(data)
-        self._fh.flush()  # flush so the log is tail-able live
-        return len(data)
-
-    def flush(self):
-        self._stream.flush()
-        self._fh.flush()
-
-    def __getattr__(self, name):  # delegate isatty(), encoding, etc.
-        return getattr(self._stream, name)
-
-
-def setup_logging(log_path: Path):
-    """Mirror all stdout/stderr of this orchestrator into log_path (append mode)."""
-    fh = open(log_path, "a", buffering=1, encoding="utf-8")
-    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    fh.write(f"\n{'='*70}\n# main.py session started {stamp}\n{'='*70}\n")
-    sys.stdout = _Tee(sys.stdout, fh)
-    sys.stderr = _Tee(sys.stderr, fh)
-    return fh
+    print(f"Done. Best val_bpb: {best_bpb if best_bpb else 'n/a'}. See results.tsv and `git log`.")
 
 
 def main():
-    # Timestamp down to the second so multiple runs on the same day never collide
-    # on the same branch (e.g. 'jun21-143022').
     default_tag = datetime.datetime.now().strftime("%b%d-%H%M%S").lower()
     p = argparse.ArgumentParser(description="Autonomous autoresearch loop via Claude Agent SDK")
     p.add_argument("--experiments", type=int, default=100, help="number of experiments to run")
     p.add_argument("--tag", default=default_tag,
                    help="run tag -> branch autoresearch/<tag> (default: timestamp, e.g. jun21-143022)")
     p.add_argument("--model", default="claude-opus-4-8", help="model id for the agent")
-    p.add_argument("--max-turns", type=int, default=80, help="max agent turns per experiment")
+    p.add_argument("--gpu", default=None, help="CUDA_VISIBLE_DEVICES for training (e.g. 1)")
+    p.add_argument("--run-timeout", type=int, default=2400,
+                   help="kill a single training run after this many seconds (hang guard)")
+    p.add_argument("--max-turns", type=int, default=12, help="max agent turns per edit proposal")
     p.add_argument("--no-setup", action="store_true", help="skip setup; continue current branch")
     p.add_argument("--log-file", default=None,
                    help="orchestrator log path (default: main_<tag>.log; '-' to disable)")
