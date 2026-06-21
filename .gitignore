@@ -21,3 +21,8 @@ dev/
 
 # Results file
 results.tsv
+
+# Logs (training run log + orchestrator session logs)
+run.log
+main_*.log
+*.log
